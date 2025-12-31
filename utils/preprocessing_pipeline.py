@@ -28,6 +28,7 @@ class FittedParams:
     side_mode_by_group: Optional[pd.Series] = None
     cabinnum_mode_by_group: Optional[pd.Series] = None
     spending_medians: Optional[dict] = None
+    spending_knn_imputer: Optional[KNNImputer] = None
 
 
 def _apply_decomposition(df: pd.DataFrame) -> pd.DataFrame:
@@ -281,15 +282,43 @@ def _impute_categorical_features(
     return df, mode_maps, encoders
 
 
-def _impute_remaining_spending(df: pd.DataFrame, medians: Optional[dict] = None) -> tuple[pd.DataFrame, dict]:
-    """imputes remaining spending NaNs with median values."""
-    if medians is None:
-        medians = {col: df[col].median() for col in SPEND_COLS}
+def _final_cryo_spending_cleanup(df: pd.DataFrame) -> pd.DataFrame:
+    """final cleanup: ensures CryoSleep passengers have 0 spending."""
+    mask = df["CryoSleep"] == True
+    df.loc[mask, SPEND_COLS] = df.loc[mask, SPEND_COLS].fillna(0)
 
-    for col in SPEND_COLS:
-        df[col] = df[col].fillna(medians[col])
+    mask_2 = (df[SPEND_COLS] > 0).any(axis=1) & df["CryoSleep"].isna()
+    df.loc[mask_2, "CryoSleep"] = False
 
-    return df, medians
+    remaining_mask = df["CryoSleep"].isna()
+    df.loc[remaining_mask, "CryoSleep"] = True
+
+    mask = df["CryoSleep"] == True
+    df.loc[mask, SPEND_COLS] = df.loc[mask, SPEND_COLS].fillna(0)
+
+    return df
+
+
+def _knn_impute_spending_train(
+    df: pd.DataFrame,
+    n_neighbors: int = 15
+) -> tuple[pd.DataFrame, KNNImputer]:
+    """
+    fits KNNImputer on training spending columns and transforms the data.
+    returns the transformed df and the fitted imputer for use on test data.
+    """
+    imputer = KNNImputer(n_neighbors=n_neighbors, weights="distance")
+    df[SPEND_COLS] = imputer.fit_transform(df[SPEND_COLS])
+    return df, imputer
+
+
+def _knn_impute_spending_test(
+    df: pd.DataFrame,
+    imputer: KNNImputer
+) -> pd.DataFrame:
+    """transforms test spending columns using a pre-fitted KNNImputer."""
+    df[SPEND_COLS] = imputer.transform(df[SPEND_COLS])
+    return df
 
 
 def _recalculate_spending_features(df: pd.DataFrame) -> pd.DataFrame:
@@ -315,12 +344,12 @@ def preprocess_train(
     3. bin Age into Age_Group (learns split points)
     4. impute spending and CryoSleep based on domain logic
     5. impute categorical features (learns mode maps)
-    6. impute remaining spending with median (optional)
+    6. final CryoSleep/spending cleanup + KNN imputation for remaining spending
     7. recalculate spending features
 
     Args:
         df: training DataFrame (must have 'Transported' column)
-        impute_spending: whether to impute remaining spending NaNs with median
+        impute_spending: whether to impute remaining spending NaNs with KNN
         verbose: whether to print progress messages
 
     Returns:
@@ -362,8 +391,12 @@ def preprocess_train(
 
     if impute_spending:
         if verbose:
-            print("Step 6: Imputing remaining spending with median...")
-        df, params.spending_medians = _impute_remaining_spending(df)
+            print("Step 6: Final CryoSleep/spending cleanup...")
+        df = _final_cryo_spending_cleanup(df)
+
+        if verbose:
+            print("Step 6b: KNN imputing remaining spending...")
+        df, params.spending_knn_imputer = _knn_impute_spending_train(df)
 
     if verbose:
         print("Step 7: Recalculating spending features...")
@@ -372,6 +405,8 @@ def preprocess_train(
     if verbose:
         print("Done! Training data preprocessed.")
 
+    df = df.drop(columns=['TotalSpent','NumSpendCategories','Group','TravelAcompanyStatus'], errors='ignore')
+    print(df.isna().sum()==0)
     return df, params
 
 
@@ -427,10 +462,14 @@ def preprocess_test(
     }
     df, _, _ = _impute_categorical_features(df, mode_maps=mode_maps, encoders=encoders, is_train=False)
 
-    if params.spending_medians is not None:
+    if verbose:
+        print("Step 6: Final CryoSleep/spending cleanup...")
+    df = _final_cryo_spending_cleanup(df)
+
+    if params.spending_knn_imputer is not None:
         if verbose:
-            print("Step 6: Imputing remaining spending with train medians...")
-        df, _ = _impute_remaining_spending(df, medians=params.spending_medians)
+            print("Step 6b: KNN imputing remaining spending (using train-fitted imputer)...")
+        df = _knn_impute_spending_test(df, params.spending_knn_imputer)
 
     if verbose:
         print("Step 7: Recalculating spending features...")
@@ -438,6 +477,7 @@ def preprocess_test(
 
     if verbose:
         print("Done! Test data preprocessed.")
+    df = df.drop(columns=['TotalSpent','NumSpendCategories','Group','TravelAcompanyStatus'], errors='ignore')
 
     return df
 
@@ -454,7 +494,6 @@ def preprocess_spaceship_data(
     Args:
         train_df: training DataFrame (must have 'Transported' column)
         test_df: test DataFrame (optional)
-        impute_spending: whether to impute remaining spending NaNs with median
         verbose: whether to print progress messages
 
     Returns:
